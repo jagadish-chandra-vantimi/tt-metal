@@ -467,22 +467,35 @@ def test_selu(device, scale, alpha, ulp_threshold):
 # rdiv — value / x
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Above this |x| the reciprocal is subnormal and flushed before the multiply.
+# |x| = 2^126, where 1/x is exactly SNB.
 RDIV_RECIP_FTZ = 1.0 / SMALLEST_NORMAL_BF16
 
 
+def _rdiv_reference(input_tensor, value):
+    """value / x in float64, so a truly subnormal quotient is not lifted to SNB by float32 rounding."""
+    return value / input_tensor.double()
+
+
 def _assert_zero_or_golden(golden, result, mask, label):
-    """Where 1/x is exactly SNB (|x| = 2^126), Blackhole flushes it to 0 and Wormhole keeps it."""
+    """Where the exact result is SNB, a result 1 ULP low is subnormal and flushes: 0 or the golden."""
     ok = (result[mask] == 0) | (result[mask] == golden[mask])
-    assert ok.all(), f"{label}: |x| = 2^126 returned neither 0 nor the golden for {int((~ok).sum())} elements"
+    assert (
+        ok.all()
+    ), f"{label}: a result of exactly SNB came back neither 0 nor the golden for {int((~ok).sum())} elements"
 
 
 def _assert_rdiv_edges(input_tensor, result, value):
-    """value / 0 is the infinity with the sign of value; |x| > 1/SNB gives exactly 0."""
+    """value / 0 is the infinity with the sign of value; |value / x| < SNB gives exactly 0.
+
+    Above |x| = 2^126 the quotient used to be 0 whatever value was, because the reciprocal
+    itself flushed (#55128). Only quotients that are themselves below SNB flush now: none for
+    value = 100, every |x| > 2^126 for value = +-1.
+    """
     zeros = input_tensor == 0
     expected = math.inf if value > 0 else -math.inf
     assert torch.equal(result[zeros], torch.full_like(result[zeros], expected)), f"rdiv({value}) / 0 is not {expected}"
-    assert_ftz_band(result, input_tensor.abs() > RDIV_RECIP_FTZ, "|x| > 1/SNB")
+    underflow = (input_tensor != 0) & (_rdiv_reference(input_tensor, value).abs() < SMALLEST_NORMAL_BF16)
+    assert_equal(torch.zeros_like(result[underflow]), result[underflow])
 
 
 # value -> (Wormhole, Blackhole) ULP threshold
@@ -493,16 +506,17 @@ RDIV_ULP = {1.0: (1, 1), -1.0: (1, 1), 2.5: (1, 2), 100.0: (1, 2)}
 def test_rdiv(device, value):
     """rdiv(x, value) = value / x, no rounding.
 
-    | value | Input range   | Check        | Reason                                     |
-    |-------|---------------|--------------|--------------------------------------------|
-    | all   | x = 0         | ±inf         | sign of value                              |
-    |       | |x| > 1/SNB   | exactly 0    | value * reciprocal(x); the reciprocal is   |
-    |       |               |              | FTZ'd                                      |
-    |       | |x| = 1/SNB   | 0 or golden  | the reciprocal is exactly SNB: Blackhole   |
-    |       |               |              | flushes it, Wormhole keeps it              |
-    | ±1    | elsewhere     | ULP ≤ 1      | only the reciprocal rounds                 |
-    | other | elsewhere     | WH ULP ≤ 1   | reciprocal and multiply each round; on BH  |
-    |       |               | BH ULP ≤ 2   | 1512 (2.5) and 496 (100) elements reach 2  |
+    | value | Input range         | Check        | Reason                                     |
+    |-------|---------------------|--------------|--------------------------------------------|
+    | all   | x = 0               | ±inf         | sign of value                              |
+    |       | |value / x| < SNB   | exactly 0    | the quotient is subnormal and FTZ'd        |
+    |       | |value / x| = SNB   | 0 or golden  | a result 1 ULP low is subnormal            |
+    | ±1    | elsewhere           | ULP ≤ 1      | only the reciprocal rounds                 |
+    | other | elsewhere           | WH ULP ≤ 1   | reciprocal and multiply each round; on BH  |
+    |       |                     | BH ULP ≤ 2   | 1512 (2.5) and 496 (100) elements reach 2  |
+
+    "Elsewhere" includes |x| > 2^126 for value = 2.5 and 100, whose quotients are normal: those
+    used to come back 0, because the reciprocal of such an x flushed (#55128).
 
     value / x overflows to ±inf on both sides for tiny x.
     """
@@ -517,9 +531,10 @@ def test_rdiv(device, value):
     result = ttnn.to_torch(ttnn.rdiv(tt_in, value, rounding_mode=None))
 
     _assert_rdiv_edges(input_tensor, result, value)
-    recip_snb = input_tensor.abs() == RDIV_RECIP_FTZ
-    _assert_zero_or_golden(golden, result, recip_snb, f"rdiv({value})")
-    keep = (input_tensor != 0) & (input_tensor.abs() < RDIV_RECIP_FTZ)
+    reference = _rdiv_reference(input_tensor, value).abs()
+    at_snb = reference == SMALLEST_NORMAL_BF16
+    _assert_zero_or_golden(golden, result, at_snb, f"rdiv({value})")
+    keep = (input_tensor != 0) & ~at_snb & (reference >= SMALLEST_NORMAL_BF16)
     assert_with_ulp(
         expected_result=golden[keep], actual_result=result[keep], ulp_threshold=ulp_threshold, allow_nonfinite=True
     )
@@ -532,11 +547,11 @@ def test_rdiv_rounded(device, value, rounding_mode):
 
     | Input range   | Check                     | Reason                                    |
     |---------------|---------------------------|-------------------------------------------|
-    | x = 0         | ±inf                      | sign of value                             |
-    | |x| > 1/SNB   | exactly 0                 | reciprocal FTZ, so floor gives 0 where    |
-    |               |                           | the true result is -1                     |
-    | elsewhere     | abs ≤ max(1, 2 ULP)       | a 1 ULP quotient error can cross an       |
-    |               | vs float64                | integer (off by one at ~150 elements)     |
+    | x = 0              | ±inf                 | sign of value                             |
+    | |value / x| < SNB  | exactly 0            | quotient FTZ, so floor gives 0 where the  |
+    |                    |                      | true result is -1                         |
+    | elsewhere          | abs ≤ max(1, 2 ULP)  | a 1 ULP quotient error can cross an       |
+    |                    | vs float64           | integer (off by one at ~150 elements)     |
 
     The reference is float64: torch's float32 floor division is itself off
     by up to 2 for quotients near 2^23.
@@ -550,10 +565,30 @@ def test_rdiv_rounded(device, value, rounding_mode):
     result = ttnn.to_torch(ttnn.rdiv(tt_in, value, rounding_mode=rounding_mode))
 
     _assert_rdiv_edges(input_tensor, result, value)
-    keep = (input_tensor != 0) & (input_tensor.abs() <= RDIV_RECIP_FTZ)
+    keep = input_tensor != 0
     golden, result = golden[keep], result[keep]
     bound = torch.clamp(2 * ulp(golden), min=1.0)
     _assert_abs_within(golden, result, bound, f"rdiv({value}, {rounding_mode})")
+
+
+@pytest.mark.parametrize("dtype", [ttnn.float32, ttnn.bfloat16], ids=["float32", "bfloat16"])
+def test_rdiv_large_x(device, dtype):
+    """rdiv(x, value) with |x| >= 2^126, where value / x is an ordinary number (#55128).
+
+    The reciprocal of such an x is below SNB and used to flush, so every one of these came back
+    0: rdiv(x, x) was 0 instead of 1.
+    """
+    value = 3.0e38
+    torch_dtype = torch.float32 if dtype == ttnn.float32 else torch.bfloat16
+    xs = [1.0e38, 2.0**126, 1.5 * 2.0**126, 2.0**127, 3.0e38, -1.0e38, -3.0e38]
+    input_tensor = torch.tensor([xs], dtype=torch_dtype).expand(32, -1).contiguous()
+
+    tt_in = ttnn.from_torch(input_tensor, dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+    result = ttnn.to_torch(ttnn.rdiv(tt_in, value, rounding_mode=None)).float()
+
+    golden = (value / input_tensor.double()).to(torch_dtype).float()
+    assert (golden.abs() >= 1).all(), "every quotient here is an ordinary number"
+    assert_with_ulp(expected_result=golden, actual_result=result, ulp_threshold=3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
