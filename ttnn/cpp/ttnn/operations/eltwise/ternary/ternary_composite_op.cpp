@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cmath>
 #include <reflect>
 
 #include "ternary_composite_op.hpp"
@@ -85,7 +86,10 @@ Tensor _addcdiv(
 }
 
 // Fallback composite implementation for lerp (with scalar weight)
-// lerp(input, end, weight) = start + weight * (end - start)
+// lerp(input, end, weight), evaluated the way torch.lerp is (aten/src/ATen/native/Lerp.h):
+//   |weight| <  0.5: input + weight * (end - input)
+//   |weight| >= 0.5: end - (1 - weight) * (end - input)
+// The second form is anchored at end, so weight = 1 returns end exactly (#53279).
 Tensor _lerp_overload(
     const Tensor& input,
     const Tensor& end,
@@ -113,8 +117,20 @@ Tensor _lerp_overload(
     }
 
     Tensor t_diff = ttnn::subtract(end, input, std::nullopt, output_mem_config);
-    Tensor t_mul = ttnn::multiply(t_diff, weight, std::nullopt, output_mem_config);
-    Tensor result = ttnn::add(input, t_mul, std::nullopt, output_mem_config);
+    // INT32 keeps the input-anchored form: torch.lerp has no integer path to match, and with a
+    // fractional weight the two forms round differently. A NaN weight fails the compare and
+    // takes the end-anchored form, which is NaN as torch's is.
+    const bool from_end = input.dtype() != DataType::INT32 && !(std::abs(weight) < 0.5f);
+    Tensor result = from_end ? ttnn::subtract(
+                                   end,
+                                   ttnn::multiply(t_diff, 1.0f - weight, std::nullopt, output_mem_config),
+                                   std::nullopt,
+                                   output_mem_config)
+                             : ttnn::add(
+                                   input,
+                                   ttnn::multiply(t_diff, weight, std::nullopt, output_mem_config),
+                                   std::nullopt,
+                                   output_mem_config);
 
     // Handle optional output tensor
     if (output_tensor.has_value()) {
@@ -153,9 +169,27 @@ Tensor _lerp(
             output_dtype);
     }
 
-    Tensor t_diff = ttnn::multiply(
-        ttnn::subtract(end, input, std::nullopt, output_mem_config), weight, std::nullopt, output_mem_config);
-    Tensor result = ttnn::add(input, t_diff, std::nullopt, output_mem_config);
+    Tensor t_diff = ttnn::subtract(end, input, std::nullopt, output_mem_config);
+    Tensor from_input = ttnn::add(
+        input, ttnn::multiply(t_diff, weight, std::nullopt, output_mem_config), std::nullopt, output_mem_config);
+    Tensor result = from_input;
+    // This fallback takes INT32 only when all three operands are INT32, and with an integer
+    // weight the two forms agree exactly (modulo 2^32), so only floating inputs take torch.lerp's
+    // branch: |weight| >= 0.5 is anchored at end, so weight = 1 returns end exactly (#53279).
+    // A NaN weight fails the compare and takes the end-anchored form, which is NaN as torch's is.
+    if (input.dtype() != DataType::INT32) {
+        Tensor one_minus_weight = ttnn::rsub(weight, 1.0f, std::nullopt, output_mem_config);
+        Tensor from_end = ttnn::subtract(
+            end,
+            ttnn::multiply(t_diff, one_minus_weight, std::nullopt, output_mem_config),
+            std::nullopt,
+            output_mem_config);
+        result = ttnn::where(
+            ttnn::lt(ttnn::abs(weight, output_mem_config), 0.5f, std::nullopt, output_mem_config),
+            from_input,
+            from_end,
+            output_mem_config);
+    }
 
     // Handle optional output tensor
     if (output_tensor.has_value()) {

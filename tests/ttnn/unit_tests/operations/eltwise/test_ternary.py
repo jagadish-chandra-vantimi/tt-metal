@@ -768,3 +768,33 @@ def test_ternary_preallocated_output_memory_distinguishes_cache_entries(device, 
         assert_equal(ttnn.to_torch(result), expected)
 
     device.disable_and_clear_program_cache()
+
+
+@pytest.mark.parametrize("weight_kind", ["scalar", "tensor"])
+@pytest.mark.parametrize(
+    "torch_dtype, ttnn_dtype, start_scale",
+    [
+        (torch.float32, ttnn.float32, 1e8),
+        (torch.bfloat16, ttnn.bfloat16, 2.0**30),
+    ],
+)
+def test_lerp_weight_one_returns_end(device, weight_kind, torch_dtype, ttnn_dtype, start_scale):
+    """lerp(input, end, 1.0) is end exactly, as torch.lerp's end-anchored branch makes it (#53279).
+
+    With |input| far above |end|, end - input rounds, and the input-anchored form alone,
+    input + 1.0 * (end - input), then misses end: lerp(1e8, 1, 1.0) was 0 in float32.
+    """
+    shape = (1, 1, 64, 64)
+    torch.manual_seed(0)
+    sign = torch.where(torch.rand(shape) > 0.5, 1.0, -1.0)
+    start = ((torch.rand(shape) + 1.0) * start_scale * sign).to(torch_dtype)
+    end = (torch.rand(shape) * 2.0 - 1.0).to(torch_dtype)
+    assert torch.equal(torch.lerp(start, end, 1.0), end)
+
+    def to_dev(host):
+        return ttnn.from_torch(host, dtype=ttnn_dtype, layout=ttnn.TILE_LAYOUT, device=device)
+
+    weight = 1.0 if weight_kind == "scalar" else to_dev(torch.ones(shape, dtype=torch_dtype))
+    result = ttnn.to_torch(ttnn.lerp(to_dev(start), to_dev(end), weight))
+
+    assert torch.equal(result, end)
