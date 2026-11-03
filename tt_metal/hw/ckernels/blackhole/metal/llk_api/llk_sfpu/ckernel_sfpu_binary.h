@@ -289,6 +289,17 @@ inline void calculate_sfpu_binary_div(
             }
             v_endif;
         } else {
+            // sfpi::approx_recip returns 0 for |in1| >= 2^126, so the quotient came out 0
+            // whatever in0 was: div(x, x) was 0, not 1 (#52094). Divide in0 / 4 by in1 / 4
+            // there instead: the quotient is the same, the reciprocal is in range, and both
+            // scalings are exact. in0 / 4 only drops bits for |in0| < 2^-124, where
+            // |in0 / in1| < 2^-250 flushes to zero anyway. Scaled lanes are never zero, so
+            // the zero-divisor arms below still see the original operands.
+            v_if(sfpi::exexp(in1) >= 126) {
+                in0 = in0 * 0.25f;
+                in1 = in1 * 0.25f;
+            }
+            v_endif;
             result = in0 * sfpu_reciprocal_iter<2>(in1);
             v_if(in1 == 0) {
                 v_if(in0 == 0) { result = std::numeric_limits<float>::quiet_NaN(); }

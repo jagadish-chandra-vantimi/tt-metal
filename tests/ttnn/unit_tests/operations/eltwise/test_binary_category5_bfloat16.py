@@ -45,26 +45,18 @@ since the scalar overloads don't take the same binary_ng path.
 
 
 def _bf16_quotient(tt_a, tt_b, input_a, input_b):
-    """The bfloat16 quotient ttnn.divide itself computes before rounding_mode
-    is applied: subnormal results flush to zero, and |b| >= 2**126 underflows
-    the reciprocal to zero too (detected from the device's own plain divide,
-    since the cutoff isn't a clean power of two).
+    """The bfloat16 quotient ttnn.divide computes before rounding_mode is
+    applied: torch's, with subnormal results flushed to zero.
+
+    Divisors with |b| >= 2**126 used to be excused here, because the accurate
+    path's reciprocal underflowed to zero and so did the quotient (#52094).
+    It no longer does, so those lanes are held to the same exact match.
     """
     raw_quotient = flush_subnormal_values_to_zero((input_a.float() / input_b.float()).clone())
-    bf16_quotient = raw_quotient.to(torch.bfloat16).float()
-
-    plain = ttnn.to_torch(ttnn.divide(tt_a, tt_b, fast_and_approximate_mode=False)).float()
-    recip_underflow = (
-        (plain == 0) & (bf16_quotient != 0) & (input_b.abs() >= 2.0**126) & torch.isfinite(bf16_quotient)
-    )
-    # Sanity check on the correction itself, not just the final result: if the
-    # device ever stopped underflowing here (or started underflowing
-    # elsewhere), this golden would silently follow it and the test would
-    # keep passing. Measured ~14,340 lanes on the full pairwise_inputs grid
-    # when this was written; a bound this loose only catches the path going
-    # fully cold, but that's still strictly better than no check at all.
-    assert recip_underflow.sum() > 0, "expected at least one |b| >= 2**126 reciprocal-underflow lane in this grid"
-    return torch.where(recip_underflow, torch.zeros_like(bf16_quotient), bf16_quotient)
+    large_divisor = (input_b.abs() >= 2.0**126) & (raw_quotient != 0) & torch.isfinite(raw_quotient)
+    # The grid has to reach the band the fix covers, or the exact match below would not cover it.
+    assert large_divisor.sum() > 0, "expected at least one |b| >= 2**126 lane with a nonzero quotient in this grid"
+    return raw_quotient.to(torch.bfloat16).float()
 
 
 @pytest.mark.parametrize(
@@ -133,6 +125,27 @@ def test_divide_round_modes(device, rounding_mode, fast_and_approximate_mode):
     else:
         golden = bf16_quotient
     assert_equal(golden, result)
+
+
+def test_divide_large_divisor(device):
+    """ttnn.divide (accurate mode) with |b| >= 2**126, where the quotient is an ordinary number (#52094).
+
+    The reciprocal of such a divisor is below 2**-126 and used to flush to zero, so every one of
+    these quotients came back 0: div(x, x) was 0 instead of 1.
+    """
+    big = [2.0**126, 1.5 * 2.0**126, 2.0**127, 3.0e38, torch.finfo(torch.bfloat16).max]
+    a = torch.tensor([big + [-v for v in big] + [2.0e38, 1.0e38, 3.0e38, 1.0, -2.0e38]], dtype=torch.bfloat16)
+    b = torch.tensor([big + big + [1.0e38, 2.0e38, 1.5e38, 2.0e38, 2.0e38]], dtype=torch.bfloat16)
+    a = a.expand(32, -1).contiguous()
+    b = b.expand(32, -1).contiguous()
+
+    result = ttnn.to_torch(
+        ttnn.divide(to_tt_tensor(a, device), to_tt_tensor(b, device), fast_and_approximate_mode=False)
+    )
+
+    golden = flush_subnormal_values_to_zero(a.float() / b.float()).to(torch.bfloat16)
+    assert torch.all(golden[:, : 2 * len(big)].abs() == 1), "x / x and -x / x are +-1"
+    assert_equal(golden.float(), result.float())
 
 
 @pytest.mark.parametrize("rounding_mode", ["trunc", "floor"])
